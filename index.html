@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+    <meta charset="UTF-8">
+    <title>EindOpdracht 1096903</title>
+    <style>
+        body{
+            margin:0;
+            background:#050505;
+            overflow:hidden;
+            color:white;
+        } /* Remove default margin, dark background, hide scrollbars*/
+        canvas{
+            width:100vw;
+            height:100vh;
+            display:block;
+        } /* Canvas fills full viewport */
+        #ui{
+            position:fixed;
+            top:10px;
+            left:10px; /* UI positioned top-left corner */
+            background:rgba(0,0,0,0.8);
+            padding:12px; /* makes background semi transparent */
+            border-radius:10px;
+            font-family:Arial;
+            font-size:12px;
+            max-width:200px;
+        }
+        label{
+            display:block;
+            margin-top:6px;
+            font-size:11px;
+            color:#aaa;
+        }
+        input[type=range]{width:100%;} /* Sliders fill width of UI */
+    </style>
+</head>
+<body>
+
+<div id="ui">
+    <strong>Settings</strong>
+    <label>Light X <input id="lightX" type="range" min="-10" max="10" step="0.1" value="5"></label>
+    <label>Light Y <input id="lightY" type="range" min="-10" max="10" step="0.1" value="5"></label>
+    <label>Ambient <input id="ambient" type="range" min="0" max="1" step="0.01" value="0.15"></label>
+    <label>Diffuse <input id="diffuse" type="range" min="0" max="1" step="0.01" value="0.7"></label>
+    <label>Specular <input id="specular" type="range" min="0" max="1" step="0.01" value="0.8"></label>
+    <strong>Controls</strong>
+    <p> W A S D = Move Around</p>
+    <p> Drag Mouse = Rotate Camera</p>
+    <p>Arrow Up / Arrow Down = move rainbow gradient</p>
+
+</div>
+<canvas id="MyCanvas"></canvas>
+
+<script>
+    const canvas=document.getElementById("MyCanvas");
+    const gl=canvas.getContext("webgl2"); // Initialize WebGL2 context
+    canvas.width=window.innerWidth; // Set canvas width to window width
+    canvas.height=window.innerHeight; // Set canvas height to window height
+    gl.viewport(0,0,canvas.width,canvas.height); // Set viewport to match canvas size
+    gl.enable(gl.DEPTH_TEST); // Enable depth testing for proper 3D rendering
+    gl.clearColor(0.02,0.02,0.05,1.0); // Set background color to dark blue/black
+
+    // ---------------- MATRIX FUNCTIONS ----------------
+    function identity(){return new Float32Array([
+        1,0,0,0,
+        0,1,0,0,
+        0,0,1,0,
+        0,0,0,1
+    ]);}
+    function translate(tx,ty,tz){return new Float32Array([
+        1,0,0,0,
+        0,1,0,0,
+        0,0,1,0,
+        tx,ty,tz,1
+    ]);}
+    function scale(sx,sy,sz){return new Float32Array([
+        sx,0,0,0,
+        0,sy,0,0,
+        0,0,sz,0,
+        0,0,0,1
+    ]);}
+    function rotateX(a){let c=Math.cos(a),s=Math.sin(a);return new Float32Array([
+        1,0,0,0,
+        0,c,s,0,
+        0,-s,c,0,
+        0,0,0,1
+    ]);}
+    function rotateY(a){let c=Math.cos(a),s=Math.sin(a);return new Float32Array([
+        c,0,-s,0,
+        0,1,0,0,
+        s,0,c,0,
+        0,0,0,1
+    ]);}
+    function multiply(a,b){let r=new Float32Array(16);
+        for(let i=0;i<4;i++)
+            for(let j=0;j<4;j++)
+                r[j*4+i]=a[0*4+i]*b[j*4+0]+a[1*4+i]*b[j*4+1]+a[2*4+i]*b[j*4+2]+a[3*4+i]*b[j*4+3];
+                return r;
+    }
+    function perspective(f,a,n,f_far){let t=1/Math.tan(f/2),i=1/(n-f_far);
+        return new Float32Array([
+            t/a,0,0,0,
+            0,t,0,0,
+            0,0,(f_far+n)*i,-1,
+            0,0,(2*f_far*n)*i,0
+        ]);}
+
+    // ---------------- SHADERS ----------------
+    const vsSource=`#version 300 es
+precision highp float;
+layout(location=0) in vec3 aPos; // Vertex position
+layout(location=1) in vec3 aNorm; // Vertex normal
+layout(location=2) in vec2 aUV; // Vertex UV coordinates
+uniform mat4 uModel; uniform mat4 uView; uniform mat4 uProjection; // Uniform matrices
+out vec3 vPos; out vec3 vNorm; out vec2 vUV; // Outputs to fragment shader
+void main(){vPos=vec3(uModel*vec4(aPos,1.0)); vNorm=mat3(uModel)*aNorm; vUV=aUV; gl_Position=uProjection*uView*vec4(vPos,1.0);}`; // Compute world position, normal, UV, projection
+
+    const fsSource=`#version 300 es
+precision highp float;
+in vec3 vPos; in vec3 vNorm; in vec2 vUV; // Inputs from vertex shader
+uniform vec3 uLightPos; uniform vec3 uLightColor; // Light position & color
+uniform float uAmbient; uniform float uDiffuse; uniform float uSpecular; // Lighting factors
+uniform float uGrad; uniform sampler2D uTex; // Gradient offset and texture
+out vec4 fCol; // Output fragment color
+vec3 hsv2rgb(vec3 c){vec3 p=abs(fract(c.xxx+vec3(0.0,2.0/3.0,1.0/3.0))*6.0-3.0);return c.z*mix(vec3(1.0),clamp(p-1.0,0.0,1.0),c.y);} // Convert HSV to RGB
+void main(){vec3 N=normalize(vNorm); vec3 L=normalize(uLightPos-vPos); vec3 V=normalize(-vPos); vec3 R=reflect(-L,N); // Normals, light dir, view dir, reflection
+float diff=max(dot(N,L),0.0); float spec=pow(max(dot(V,R),0.0),32.0); // Diffuse & specular
+vec3 tex=texture(uTex,vUV*3.0).rgb; // Sample texture
+vec3 rainbow=hsv2rgb(vec3(fract(vPos.y*0.1+uGrad),0.8,1.0)); // Rainbow gradient
+vec3 color=mix(tex,rainbow,0.4)*(uAmbient+uDiffuse*diff+uSpecular*spec)*uLightColor; // Combine lighting and texture
+fCol=vec4(color,1.0);}`; // Output final color
+
+    function createShader(type,source){const s=gl.createShader(type);
+        gl.shaderSource(s,source);
+        gl.compileShader(s);
+        if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))console.error(gl.getShaderInfoLog(s));
+        return s;
+    } // Compile shader
+    function createProgram(vs,fs){const p=gl.createProgram();
+        gl.attachShader(p,createShader(gl.VERTEX_SHADER,vs));
+        gl.attachShader(p,createShader(gl.FRAGMENT_SHADER,fs));
+        gl.linkProgram(p);
+        if(!gl.getProgramParameter(p,gl.LINK_STATUS))console.error(gl.getProgramInfoLog(p));
+        return p;
+    } // Link program
+    const prog=createProgram(vsSource,fsSource); gl.useProgram(prog); // Use program
+
+    // ---------------- TEXTURES ----------------
+    function loadTexture(url){ // Load texture from URL
+        const tex=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,tex); // Create & bind texture
+        gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,1,1,0,gl.RGBA,gl.UNSIGNED_BYTE,new Uint8Array([255,0,255,255])); // Placeholder
+        const img=new Image(); img.src=url; // Load image
+        img.onload=()=>{gl.bindTexture(gl.TEXTURE_2D,tex);
+            gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,img);
+            gl.generateMipmap(gl.TEXTURE_2D);} // Upload when ready
+        return tex; // Return texture
+    }
+
+    const texPortal=loadTexture("texture_portal.png"); // Sphere texture
+
+
+    // ---------------- GEOMETRY ----------------
+    function createMesh(v,i){const vao=gl.createVertexArray();
+        gl.bindVertexArray(vao);
+        gl.bindBuffer(gl.ARRAY_BUFFER,gl.createBuffer());
+        gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(v),gl.STATIC_DRAW);
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,gl.createBuffer());
+        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,new Uint16Array(i),gl.STATIC_DRAW);
+        gl.vertexAttribPointer(0,3,gl.FLOAT,false,32,0);
+        gl.enableVertexAttribArray(0);
+        gl.vertexAttribPointer(1,3,gl.FLOAT,false,32,12);
+        gl.enableVertexAttribArray(1);
+        gl.vertexAttribPointer(2,2,gl.FLOAT,false,32,24);
+        gl.enableVertexAttribArray(2);
+        return {vao,count:i.length};
+    } // Create VAO, upload vertices & indices
+    function generateSphere(r,s){let v=[],i=[];
+        for(let y=0;y<=s;y++){let lat=y*Math.PI/s;
+            for(let x=0;x<=s;x++){let lon=x*2*Math.PI/s;
+                let px=Math.cos(lon)*Math.sin(lat)*r, py=Math.cos(lat)*r, pz=Math.sin(lon)*Math.sin(lat)*r;
+                v.push(px,py,pz, px/r,py/r,pz/r,1-x/s,y/s);}}
+        for(let y=0;y<s;y++)
+        {for(let x=0;x<s;x++){let a=y*(s+1)+x, b=a+s+1; i.push(a,b,a+1,b,b+1,a+1);}}
+        return createMesh(v,i);} // Generate sphere vertices & indices
+
+    // Load Tinker OBJ
+    let tinkerModel=null; // Initialize variable
+    async function loadOBJ(url){ // Load .obj file
+        const res=await fetch(url); // Fetch file
+        const text=await res.text(); // Get text content
+        const v=[],vn=[],vt=[],fV=[],fI=[]; // Temporary arrays
+        text.split('\n').forEach(line=>{
+            const p=line.trim().split(/\s+/); // Split line into parts
+            if(p[0]=='v')v.push(p.slice(1).map(Number)); // Vertex
+            if(p[0]=='vn')vn.push(p.slice(1).map(Number)); // Normal
+            if(p[0]=='vt')vt.push(p.slice(1).map(Number)); // UV
+            if(p[0]=='f')p.slice(1).forEach(face=>{
+                const parts=face.split('/').map(n=>parseInt(n)-1); // Vertex/UV/Normal
+                fV.push(...v[parts[0]], ...(vn[parts[2]]||[0,1,0]), ...(vt[parts[1]]||[0,0])); // Flatten
+                fI.push(fI.length); // Push index
+            });
+        });
+        return createMesh(fV,fI); // Create mesh
+    }
+    loadOBJ("https://raw.githubusercontent.com/RikoSakurauchi/eindopdracht/refs/heads/main/tinker.obj").then(m=>tinkerModel=m); // Load OBJ asynchronously
+
+    const sphere=generateSphere(1.5,32); // Create sphere
+
+    // ---------------- CAMERA ----------------
+    let camRotX=0, camRotY=0, camPos=[0,0,15]; // Camera rotation & position
+    let drag=false; canvas.onmousedown=()=>drag=true; window.onmouseup=()=>drag=false; // Mouse drag
+    canvas.onmousemove=e=>{if(drag){camRotY+=e.movementX*0.01; camRotX+=e.movementY*0.01;}}; // Rotate camera
+    canvas.onwheel=e=>{camPos[2]+=e.deltaY*0.05; camPos[2]=Math.max(5,Math.min(30,camPos[2]));}; // Zoom
+
+    const keys={}; // Key state
+    window.addEventListener("keydown",e=>keys[e.key]=true); // Key down
+    window.addEventListener("keyup",e=>keys[e.key]=false); // Key up
+
+    // ---------------- GRADIENT ----------------
+    let grad=0,time=0; // Gradient & time
+    window.addEventListener("keydown",e=>{if(e.key==="ArrowUp")grad+=0.05;if(e.key==="ArrowDown")grad-=0.05;}); // Adjust gradient
+
+    // ---------------- RENDER ----------------
+    let cubeAngle=0; // Orbit angle
+    function render(){
+        time+=0.01; // Increment time
+
+        // Update camera
+        const speed=0.1; // Movement speed
+        const forward=[Math.sin(camRotY)*speed,0,Math.cos(camRotY)*speed]; // Forward vector
+        const right=[Math.cos(camRotY)*speed,0,-Math.sin(camRotY)*speed]; // Right vector
+        if(keys["w"]) camPos[0]-=forward[0], camPos[2]-=forward[2]; // Move forward
+        if(keys["s"]) camPos[0]+=forward[0], camPos[2]+=forward[2]; // Move backward
+        if(keys["a"]) camPos[0]-=right[0], camPos[2]-=right[2]; // Move left
+        if(keys["d"]) camPos[0]+=right[0], camPos[2]+=right[2]; // Move right
+
+        gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT); // Clear screen
+
+        const P=perspective(Math.PI/4,canvas.width/canvas.height,0.1,100); // Projection
+        let V=multiply(rotateX(camRotX),rotateY(camRotY)); // Camera rotation
+        V=multiply(V,translate(-camPos[0],-camPos[1],-camPos[2])); // Camera translation
+
+        // Light uniforms
+        const lx=parseFloat(document.getElementById("lightX").value); // X light
+        const ly=parseFloat(document.getElementById("lightY").value); // Y light
+        const ambient=parseFloat(document.getElementById("ambient").value); // Ambient
+        const diffuse=parseFloat(document.getElementById("diffuse").value); // Diffuse
+        const specular=parseFloat(document.getElementById("specular").value); // Specular
+
+        gl.uniformMatrix4fv(gl.getUniformLocation(prog,"uView"),false,V); // Send view
+        gl.uniformMatrix4fv(gl.getUniformLocation(prog,"uProjection"),false,P); // Send projection
+        gl.uniform3f(gl.getUniformLocation(prog,"uLightPos"),lx,ly,5); // Send light position
+        gl.uniform3f(gl.getUniformLocation(prog,"uLightColor"),1,1,1); // Send light color
+        gl.uniform1f(gl.getUniformLocation(prog,"uAmbient"),ambient); // Send ambient
+        gl.uniform1f(gl.getUniformLocation(prog,"uDiffuse"),diffuse); // Send diffuse
+        gl.uniform1f(gl.getUniformLocation(prog,"uSpecular"),specular); // Send specular
+        gl.uniform1f(gl.getUniformLocation(prog,"uGrad"),grad+time*0.2); // Send gradient
+
+        // Draw sphere
+        gl.bindTexture(gl.TEXTURE_2D,texPortal); // Bind sphere texture
+        gl.uniformMatrix4fv(gl.getUniformLocation(prog,"uModel"),false,identity()); // Model matrix identity
+        gl.bindVertexArray(sphere.vao); // Bind sphere VAO
+        gl.drawElements(gl.TRIANGLES,sphere.count,gl.UNSIGNED_SHORT,0); // Draw sphere
+
+        // Draw Tinker OBJ orbiting sphere
+        if(tinkerModel){
+            cubeAngle+=0.01; // Increment orbit
+            let m=multiply(rotateY(cubeAngle),translate(6,0,0)); // Orbit translation
+            m=multiply(m,scale(0.1,0.1,0.1)); // Scale down
+            gl.uniformMatrix4fv(gl.getUniformLocation(prog,"uModel"),false,m); // Send model
+            gl.bindVertexArray(tinkerModel.vao); // Bind VAO
+            gl.drawElements(gl.TRIANGLES,tinkerModel.count,gl.UNSIGNED_SHORT,0); // Draw Tinker
+        }
+
+        requestAnimationFrame(render); // Loop
+    }
+    render(); // Start render loop
+</script>
+</body>
+</html>
